@@ -1,4 +1,5 @@
 import copy
+import ast
 import glob
 import json
 import os
@@ -6,42 +7,36 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import random
-import subprocess
-
-import openai
-import ai2thor.controller
 
 import sys
 sys.path.append(".")
+
+try:
+    import ai2thor.controller as ai2thor_controller
+except Exception:
+    ai2thor_controller = None
+
+try:
+    from llm_client import LLMClient
+except ModuleNotFoundError:
+    from scripts.llm_client import LLMClient
 
 import resources.actions as actions
 import resources.robots as robots
 
 
-def LM(prompt, gpt_version, max_tokens=128, temperature=0, stop=None, logprobs=1, frequency_penalty=0):
-    
-    if "gpt" not in gpt_version:
-        response = openai.Completion.create(model=gpt_version, 
-                                            prompt=prompt, 
-                                            max_tokens=max_tokens, 
-                                            temperature=temperature, 
-                                            stop=stop, 
-                                            logprobs=logprobs, 
-                                            frequency_penalty = frequency_penalty)
-        
-        return response, response["choices"][0]["text"].strip()
-    
-    else:
-        response = openai.ChatCompletion.create(model=gpt_version, 
-                                            messages=prompt, 
-                                            max_tokens=max_tokens, 
-                                            temperature=temperature, 
-                                            frequency_penalty = frequency_penalty)
-        
-        return response, response["choices"][0]["message"]["content"].strip()
+LLM_CLIENT = None
 
-def set_api_key(openai_api_key):
-    openai.api_key = Path(openai_api_key + '.txt').read_text()
+
+def LM(prompt, max_tokens=128, temperature=0, stop=None, logprobs=1, frequency_penalty=0):
+    return LLM_CLIENT.generate(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stop=stop,
+        logprobs=logprobs,
+        frequency_penalty=frequency_penalty,
+    )
 
 # Function returns object list with name and properties.
 def convert_to_dict_objprop(objs, obj_mass):
@@ -52,21 +47,43 @@ def convert_to_dict_objprop(objs, obj_mass):
         objs_dict.append(obj_dict)
     return objs_dict
 
+def load_fallback_objects():
+    fallback_path = Path(os.getcwd()) / "data" / "pythonic_plans" / "train_task_allocation_solution.py"
+    with open(fallback_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("objects = "):
+                return ast.literal_eval(stripped[len("objects = "):])
+
+    raise RuntimeError("Could not load the fallback AI2Thor object catalog.")
+
 def get_ai2_thor_objects(floor_plan_id):
-    # connector to ai2thor to get object list
-    controller = ai2thor.controller.Controller(scene="FloorPlan"+str(floor_plan_id))
-    obj = list([obj["objectType"] for obj in controller.last_event.metadata["objects"]])
-    obj_mass = list([obj["mass"] for obj in controller.last_event.metadata["objects"]])
-    controller.stop()
-    obj = convert_to_dict_objprop(obj, obj_mass)
-    return obj
+    fallback_objects = load_fallback_objects()
+
+    if ai2thor_controller is None:
+        print("AI2Thor is unavailable in this environment; using a static object catalog for prompt generation.")
+        return fallback_objects
+
+    try:
+        # connector to ai2thor to get object list
+        controller = ai2thor_controller.Controller(scene="FloorPlan" + str(floor_plan_id))
+        obj = list([obj["objectType"] for obj in controller.last_event.metadata["objects"]])
+        obj_mass = list([obj["mass"] for obj in controller.last_event.metadata["objects"]])
+        controller.stop()
+        obj = convert_to_dict_objprop(obj, obj_mass)
+        return obj
+    except Exception as exc:
+        print(f"AI2Thor scene inspection failed ({exc}); using a static object catalog for prompt generation.")
+        return fallback_objects
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--floor-plan", type=int, required=True)
-    parser.add_argument("--openai-api-key-file", type=str, default="api_key")
+    parser.add_argument("--openai-api-key-file", "--api-key-file", dest="api_key_file", type=str, default="api_key")
+    parser.add_argument("--provider", type=str, default="auto", choices=["auto", "openai", "deepseek", "gemini"])
     parser.add_argument("--gpt-version", type=str, default="gpt-4", 
-                        choices=['gpt-3.5-turbo', 'gpt-4', 'gpt-3.5-turbo-16k'])
+                        help="LLM model name, for example gpt-4o-mini, deepseek-chat, or gemini-2.0-flash")
+    parser.add_argument("--base-url", type=str, default=None)
     
     parser.add_argument("--prompt-decompse-set", type=str, default="train_task_decompose", 
                         choices=['train_task_decompose'])
@@ -81,7 +98,12 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    set_api_key(args.openai_api_key_file)
+    LLM_CLIENT = LLMClient.from_config(
+        provider=args.provider,
+        model=args.gpt_version,
+        api_key_file=args.api_key_file,
+        base_url=args.base_url,
+    )
     
     if not os.path.isdir(f"./logs/"):
         os.makedirs(f"./logs/")
@@ -106,7 +128,7 @@ if __name__ == "__main__":
     for robots_list in robots_test_tasks:
         task_robots = []
         for i, r_id in enumerate(robots_list):
-            rob = robots.robots [r_id-1]
+            rob = copy.deepcopy(robots.robots[r_id - 1])
             # rename the robot
             rob['name'] = 'robot' + str(i+1)
             task_robots.append(rob)
@@ -134,13 +156,9 @@ if __name__ == "__main__":
     decomposed_plan = []
     for task in test_tasks:
         curr_prompt =  f"{prompt}\n\n# Task Description: {task}"
-        
-        if "gpt" not in args.gpt_version:
-            # older gpt versions
-            _, text = LM(curr_prompt, args.gpt_version, max_tokens=1000, stop=["def"], frequency_penalty=0.15)
-        else:            
-            messages = [{"role": "user", "content": curr_prompt}]
-            _, text = LM(messages,args.gpt_version, max_tokens=1300, frequency_penalty=0.0)
+
+        messages = [{"role": "user", "content": curr_prompt}]
+        _, text = LM(messages, max_tokens=1300, frequency_penalty=0.0)
 
         decomposed_plan.append(text)
         
@@ -159,6 +177,17 @@ if __name__ == "__main__":
     prompt += "\n\n" + allocated_prompt + "\n\n"
     
     allocated_plan = []
+    allocation_system_prompt = (
+        "You are a Robot Task Allocation Expert. Determine whether the subtasks must be "
+        "performed sequentially or in parallel, or a combination of both based on your "
+        "reasoning. In the case of Task Allocation based on Robot Skills alone - First "
+        "check if robot teams are required. Then ensure that robot skills or robot team "
+        "skills match the required skills for the subtask when allocating. In the case of "
+        "Task Allocation based on Mass alone - First check if robot teams are required. "
+        "Then ensure that robot mass capacity or robot team combined mass capacity is "
+        "greater than or equal to the mass for the object when allocating. In both cases, "
+        "if there are multiple options for allocation, pick the best available option."
+    )
     for i, plan in enumerate(decomposed_plan):
         no_robot  = len(available_robots[i])
         curr_prompt = prompt + plan
@@ -169,19 +198,11 @@ if __name__ == "__main__":
         curr_prompt += f"\n\n# IMPORTANT: The AI should ensure that the robots assigned to the tasks have all the necessary skills to perform the tasks. IMPORTANT: Determine whether the subtasks must be performed sequentially or in parallel, or a combination of both and allocate robots based on availablitiy. "
         curr_prompt += f"\n# SOLUTION  \n"
 
-        if "gpt" not in args.gpt_version:
-            # older versions of GPT
-            _, text = LM(curr_prompt, args.gpt_version, max_tokens=1000, stop=["def"], frequency_penalty=0.65)
-        
-        elif "gpt-3.5" in args.gpt_version:
-            # gpt 3.5 and its variants
-            messages = [{"role": "user", "content": curr_prompt}]
-            _, text = LM(messages, args.gpt_version, max_tokens=1500, frequency_penalty=0.35)
-        
-        else:          
-            # gpt 4.0
-            messages = [{"role": "system", "content": "You are a Robot Task Allocation Expert. Determine whether the subtasks must be performed sequentially or in parallel, or a combination of both based on your reasoning. In the case of Task Allocation based on Robot Skills alone - First check if robot teams are required. Then Ensure that robot skills or robot team skills match the required skills for the subtask when allocating. Make sure that condition is met. In the case of Task Allocation based on Mass alone - First check if robot teams are required. Then Ensure that robot mass capacity or robot team combined mass capacity is greater than or equal to the mass for the object when allocating. Make sure that condition is met. In both the Task Task Allocation based on Mass alone and Task Allocation based on Skill alone, if there are multiple options for allocation, pick the best available option by reasoning to the best of your ability."},{"role": "system", "content": "You are a Robot Task Allocation Expert"},{"role": "user", "content": curr_prompt}]
-            _, text = LM(messages, args.gpt_version, max_tokens=400, frequency_penalty=0.69)
+        messages = [
+            {"role": "system", "content": allocation_system_prompt},
+            {"role": "user", "content": curr_prompt},
+        ]
+        _, text = LM(messages, max_tokens=700, frequency_penalty=0.35)
 
         allocated_plan.append(text)
     
@@ -195,6 +216,7 @@ if __name__ == "__main__":
     prompt += objects_ai
     
     code_plan = []
+    code_system_prompt = "You are a Robot Task Allocation Expert. Return only valid Python code."
 
     prompt_file1 = os.getcwd() + "/data/pythonic_plans/" + args.prompt_allocation_set + "_code.py"
     code_prompt_file = open(prompt_file1, "r")
@@ -209,14 +231,12 @@ if __name__ == "__main__":
         curr_prompt += f"\n\nrobots = {available_robots[i]}"
         curr_prompt += solution
         curr_prompt += f"\n# CODE Solution  \n"
-        
-        if "gpt" not in args.gpt_version:
-            # older versions of GPT
-            _, text = LM(curr_prompt, args.gpt_version, max_tokens=1000, stop=["def"], frequency_penalty=0.30)
-        else:            
-            # using variants of gpt 4 or 3.5
-            messages = [{"role": "system", "content": "You are a Robot Task Allocation Expert"},{"role": "user", "content": curr_prompt}]
-            _, text = LM(messages, args.gpt_version, max_tokens=1400, frequency_penalty=0.4)
+
+        messages = [
+            {"role": "system", "content": code_system_prompt},
+            {"role": "user", "content": curr_prompt},
+        ]
+        _, text = LM(messages, max_tokens=1400, frequency_penalty=0.4)
 
         code_plan.append(text)
     
@@ -237,7 +257,8 @@ if __name__ == "__main__":
      
             with open(f"./logs/{folder_name}/log.txt", 'w') as f:
                 f.write(task)
-                f.write(f"\n\nGPT Version: {args.gpt_version}")
+                f.write(f"\n\nLLM Provider: {LLM_CLIENT.provider}")
+                f.write(f"\nLLM Model: {args.gpt_version}")
                 f.write(f"\n\nFloor Plan: {args.floor_plan}")
                 f.write(f"\n{objects_ai}")
                 f.write(f"\nrobots = {available_robots[idx]}")

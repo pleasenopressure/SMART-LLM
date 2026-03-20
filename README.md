@@ -19,10 +19,12 @@ Install dependencies:
 pip install -r requirments.txt
 ```
 
-## Creating OpenAI API Key
-The code relies on OpenAI API. Create an API Key at https://platform.openai.com/.
+## LLM API Key
+The code now supports multiple LLM providers, including OpenAI-compatible models, DeepSeek, and Gemini.
 
-Create a file named ```api_key.txt``` in the root folder of the project and paste your OpenAI Key in the file. 
+Create a file named ```api_key.txt``` in the root folder of the project and paste the key for the provider you want to use.
+
+You can also pass a different file with ```--api-key-file```.
 
 ## Running Script
 Run the following command to generate output execuate python scripts to perform the tasks in the given AI2Thor floor plans. 
@@ -31,9 +33,21 @@ Refer to https://ai2thor.allenai.org/demo for the layout of various AI2Thor floo
 ```
 python3 scripts/run_llm.py --floor-plan {floor_plan_no}
 ```
-Note: Refer to the script for running it on different versions of GPT models and changing the test dataset. 
+By default the script uses the OpenAI provider with ```gpt-4``` as the model name.
+
+Examples:
+```
+python3 scripts/run_llm.py --floor-plan 1 --provider openai --gpt-version gpt-4o-mini --api-key-file api_key
+python3 scripts/run_llm.py --floor-plan 1 --provider deepseek --gpt-version deepseek-chat --api-key-file deepseek_api_key
+python3 scripts/run_llm.py --floor-plan 1 --provider gemini --gpt-version gemini-2.0-flash --api-key-file gemini_api_key
+```
+
+If you use ```--provider auto```, the code infers the provider from the model name:
+```gemini-*``` uses Gemini, ```deepseek-*``` uses DeepSeek, and everything else uses an OpenAI-compatible endpoint.
 
 The above script should generate the executable code and store it in the ```logs``` folder.
+
+Note: AI2Thor execution still requires a Linux/macOS environment. On native Windows, the generation step can use the static fallback object catalog, but ```scripts/execute_plan.py``` must run inside Ubuntu, WSL2, or Docker.
 
 
 Run the following script to execute the above generated scripts and execute it in an AI2THOR environment. 
